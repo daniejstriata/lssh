@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Blacknon. All rights reserved.
+// Copyright (c) 2026 Blacknon. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
 
@@ -64,8 +64,15 @@ func (c *Connect) X11Forward(session *ssh.Session) (err error) {
 	ok, err := session.SendRequest("x11-req", true, ssh.Marshal(payload))
 	if err == nil && !ok {
 		return errors.New("ssh: x11-req failed")
-	} else {
-		// Open HandleChannel x11
+	}
+
+	c.startX11ChannelHandler()
+
+	return err
+}
+
+func (c *Connect) startX11ChannelHandler() {
+	c.x11HandlerOnce.Do(func() {
 		x11channels := c.Client.HandleChannelOpen("x11")
 
 		go func() {
@@ -78,9 +85,7 @@ func (c *Connect) X11Forward(session *ssh.Session) (err error) {
 				go x11forwarder(channel)
 			}
 		}()
-	}
-
-	return err
+	})
 }
 
 // x11Connect return net.Conn x11 socket.
@@ -152,30 +157,68 @@ func getX11DisplayNumber(display string) int {
 	return i
 }
 
-// TCPLocalForward forwarding tcp data. Like Local port forward (ssh -L).
-// localAddr, remoteAddr is write as "address:port".
-//
-// example) "127.0.0.1:22", "abc.com:9977"
-func (c *Connect) TCPLocalForward(localAddr, remoteAddr string) (err error) {
-	// create listener
-	listener, err := net.Listen("tcp", localAddr)
+// LocalForward forwards data from a local listener to a remote destination over SSH.
+// This supports both TCP and Unix domain sockets.
+func (c *Connect) LocalForward(localNetwork, localAddr, remoteNetwork, remoteAddr string) (err error) {
+	listener, err := net.Listen(localNetwork, localAddr)
 	if err != nil {
 		return
 	}
 
-	// forwarding
 	go func() {
 		for {
-			// local (type net.Conn)
 			local, err := listener.Accept()
 			if err != nil {
 				return
 			}
 
-			// remote (type net.Conn)
-			remote, err := c.Client.Dial("tcp", remoteAddr)
+			remote, err := c.Dial(remoteNetwork, remoteAddr)
+			if err != nil {
+				_ = local.Close()
+				continue
+			}
 
-			// forward
+			go c.forwarder(local, remote)
+		}
+	}()
+
+	return
+}
+
+// TCPLocalForward forwarding tcp data. Like Local port forward (ssh -L).
+// localAddr, remoteAddr is write as "address:port".
+//
+// example) "127.0.0.1:22", "abc.com:9977"
+func (c *Connect) TCPLocalForward(localAddr, remoteAddr string) error {
+	return c.LocalForward("tcp", localAddr, "tcp", remoteAddr)
+}
+
+// UnixLocalForward forwards a local Unix domain socket to a remote Unix domain socket.
+func (c *Connect) UnixLocalForward(localPath, remotePath string) error {
+	return c.LocalForward("unix", localPath, "unix", remotePath)
+}
+
+// RemoteForward forwards data from a remote listener back to a local destination.
+// This supports both TCP and Unix domain sockets.
+func (c *Connect) RemoteForward(localNetwork, localAddr, remoteNetwork, remoteAddr string) (err error) {
+	listener, err := c.Listen(remoteNetwork, remoteAddr)
+	if err != nil {
+		return
+	}
+
+	go func() {
+		for {
+			local, err := net.Dial(localNetwork, localAddr)
+			if err != nil {
+				continue
+			}
+
+			remote, err := listener.Accept()
+			if err != nil {
+				_ = local.Close()
+				return
+			}
+
 			go c.forwarder(local, remote)
 		}
 	}()
@@ -187,33 +230,13 @@ func (c *Connect) TCPLocalForward(localAddr, remoteAddr string) (err error) {
 // localAddr, remoteAddr is write as "address:port".
 //
 // example) "127.0.0.1:22", "abc.com:9977"
-func (c *Connect) TCPRemoteForward(localAddr, remoteAddr string) (err error) {
-	// create listener
-	listener, err := c.Client.Listen("tcp", remoteAddr)
-	if err != nil {
-		return
-	}
+func (c *Connect) TCPRemoteForward(localAddr, remoteAddr string) error {
+	return c.RemoteForward("tcp", localAddr, "tcp", remoteAddr)
+}
 
-	// forwarding
-	go func() {
-		for {
-			// local (type net.Conn)
-			local, err := net.Dial("tcp", localAddr)
-			if err != nil {
-				return
-			}
-
-			// remote (type net.Conn)
-			remote, err := listener.Accept()
-			if err != nil {
-				return
-			}
-
-			go c.forwarder(local, remote)
-		}
-	}()
-
-	return
+// UnixRemoteForward forwards a remote Unix domain socket to a local Unix domain socket.
+func (c *Connect) UnixRemoteForward(localPath, remotePath string) error {
+	return c.RemoteForward("unix", localPath, "unix", remotePath)
 }
 
 // forwarder tcp/udp port forward. dialType in `tcp` or `udp`.
@@ -260,7 +283,7 @@ func (c *Connect) TCPDynamicForward(address, port string) (err error) {
 	// Create Socks5 config
 	conf := &socks5.Config{
 		Dial: func(ctx context.Context, n, addr string) (net.Conn, error) {
-			return c.Client.Dial(n, addr)
+			return c.Dial(n, addr)
 		},
 		Resolver: socks5Resolver{},
 		Logger:   c.getDynamicForwardLogger(),
@@ -291,7 +314,7 @@ func (c *Connect) TCPReverseDynamicForward(address, port string) (err error) {
 	}
 
 	// create listener
-	listener, err := c.Client.Listen("tcp", net.JoinHostPort(address, port))
+	listener, err := c.Listen("tcp", net.JoinHostPort(address, port))
 	if err != nil {
 		return
 	}
@@ -311,7 +334,7 @@ func (c *Connect) TCPReverseDynamicForward(address, port string) (err error) {
 // Like Dynamic forward (`ssh -D <port>`). but use http proxy.
 func (c *Connect) HTTPDynamicForward(address, port string) (err error) {
 	// create dial
-	dial := c.Client.Dial
+	dial := c.Dial
 
 	// create listener
 	listener, err := net.Listen("tcp", net.JoinHostPort(address, port))
@@ -344,7 +367,7 @@ func (c *Connect) HTTPReverseDynamicForward(address, port string) (err error) {
 	dial := net.Dial
 
 	// create listener
-	listener, err := c.Client.Listen("tcp", net.JoinHostPort(address, port))
+	listener, err := c.Listen("tcp", net.JoinHostPort(address, port))
 	if err != nil {
 		return
 	}

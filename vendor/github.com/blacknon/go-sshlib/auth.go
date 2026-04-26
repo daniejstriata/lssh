@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Blacknon. All rights reserved.
+// Copyright (c) 2026 Blacknon. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
 
@@ -16,15 +16,206 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
+	"unsafe"
 
 	"github.com/ScaleFT/sshkeys"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
 
+type ControlPersistAuth struct {
+	// AuthMethods allows reusing auth methods created by sshlib helper functions
+	// such as CreateAuthMethodPassword/CreateAuthMethodPublicKey.
+	AuthMethods []ssh.AuthMethod `json:"-"`
+
+	// Methods stores serializable auth definitions for detached ControlPersist
+	// helpers and proxy routes.
+	Methods []ControlPersistAuthMethod
+}
+
+type ControlPersistAuthMethod struct {
+	Type string
+
+	Password string
+
+	KeyPath string
+	KeyPass string
+
+	PKCS11Provider string
+	PKCS11PIN      string
+}
+
+type authMethodRegistryKey struct {
+	typ  uintptr
+	data uintptr
+}
+
+type controlPersistAuthMethodDefinition struct {
+	Type string
+
+	Password string
+
+	KeyPath string
+	KeyPass string
+
+	PKCS11Provider string
+	PKCS11PIN      string
+}
+
+var controlPersistAuthMethodRegistry sync.Map
+
+func (a *ControlPersistAuth) resolved() ([]controlPersistAuthMethodDefinition, error) {
+	if a == nil {
+		return nil, fmt.Errorf("sshlib: ControlPersistAuth is required for detached ControlPersist helper")
+	}
+
+	if len(a.Methods) > 0 {
+		resolved := make([]controlPersistAuthMethodDefinition, 0, len(a.Methods))
+		for _, method := range a.Methods {
+			resolved = append(resolved, controlPersistAuthMethodDefinition{
+				Type:           method.Type,
+				Password:       method.Password,
+				KeyPath:        method.KeyPath,
+				KeyPass:        method.KeyPass,
+				PKCS11Provider: method.PKCS11Provider,
+				PKCS11PIN:      method.PKCS11PIN,
+			})
+		}
+		if err := validateControlPersistAuthDefinitions(resolved); err != nil {
+			return nil, err
+		}
+		return resolved, nil
+	}
+
+	if len(a.AuthMethods) == 0 {
+		return nil, fmt.Errorf("sshlib: ControlPersistAuth.AuthMethods is required for detached ControlPersist helper")
+	}
+
+	resolved := make([]controlPersistAuthMethodDefinition, 0, len(a.AuthMethods))
+	for _, authMethod := range a.AuthMethods {
+		persistAuth, ok := lookupControlPersistAuthMethod(authMethod)
+		if !ok {
+			return nil, fmt.Errorf("sshlib: unsupported authMethod for ControlPersistAuth; use sshlib.CreateAuthMethodPassword/CreateAuthMethodPublicKey")
+		}
+		resolved = append(resolved, *persistAuth)
+	}
+	return resolved, nil
+}
+
+func createControlPersistAuthMethods(definitions []controlPersistAuthMethodDefinition) ([]ssh.AuthMethod, error) {
+	return createControlPersistAuthMethodsWithPrompt(definitions, nil)
+}
+
+func createControlPersistAuthMethodsWithPrompt(definitions []controlPersistAuthMethodDefinition, prompt PromptFunc) ([]ssh.AuthMethod, error) {
+	if err := validateControlPersistAuthDefinitions(definitions); err != nil {
+		return nil, err
+	}
+
+	authMethods := make([]ssh.AuthMethod, 0, len(definitions))
+	for _, persistAuth := range definitions {
+		switch persistAuth.Type {
+		case "password":
+			authMethods = append(authMethods, CreateAuthMethodPassword(persistAuth.Password))
+		case "publickey":
+			auth, err := CreateAuthMethodPublicKey(persistAuth.KeyPath, persistAuth.KeyPass)
+			if err != nil {
+				return nil, err
+			}
+			authMethods = append(authMethods, auth)
+		case "pkcs11":
+			auth, err := CreateAuthMethodPKCS11WithPrompt(persistAuth.PKCS11Provider, persistAuth.PKCS11PIN, prompt)
+			if err != nil {
+				return nil, err
+			}
+			authMethods = append(authMethods, auth...)
+		default:
+			return nil, fmt.Errorf("sshlib: unsupported ControlPersistAuth type %q", persistAuth.Type)
+		}
+	}
+
+	return authMethods, nil
+}
+
+func validateControlPersistAuthDefinitions(definitions []controlPersistAuthMethodDefinition) error {
+	if len(definitions) == 0 {
+		return fmt.Errorf("sshlib: ControlPersistAuth.AuthMethods is required for detached ControlPersist helper")
+	}
+
+	for _, persistAuth := range definitions {
+		switch persistAuth.Type {
+		case "password":
+			if persistAuth.Password == "" {
+				return fmt.Errorf("sshlib: password auth requires Password")
+			}
+		case "publickey":
+			if persistAuth.KeyPath == "" {
+				return fmt.Errorf("sshlib: publickey auth requires KeyPath")
+			}
+		case "pkcs11":
+			if persistAuth.PKCS11Provider == "" {
+				return fmt.Errorf("sshlib: pkcs11 auth requires PKCS11Provider")
+			}
+		default:
+			return fmt.Errorf("sshlib: unsupported ControlPersistAuth type %q", persistAuth.Type)
+		}
+	}
+
+	return nil
+}
+
+func registerControlPersistAuthMethod(auth ssh.AuthMethod, persistAuth controlPersistAuthMethodDefinition) {
+	key, ok := controlPersistAuthMethodKey(auth)
+	if !ok {
+		return
+	}
+
+	controlPersistAuthMethodRegistry.Store(key, persistAuth)
+}
+
+func lookupControlPersistAuthMethod(auth ssh.AuthMethod) (*controlPersistAuthMethodDefinition, bool) {
+	key, ok := controlPersistAuthMethodKey(auth)
+	if !ok {
+		return nil, false
+	}
+
+	value, ok := controlPersistAuthMethodRegistry.Load(key)
+	if !ok {
+		return nil, false
+	}
+
+	persistAuth, ok := value.(controlPersistAuthMethodDefinition)
+	if !ok {
+		return nil, false
+	}
+
+	return &persistAuth, true
+}
+
+func controlPersistAuthMethodKey(auth ssh.AuthMethod) (authMethodRegistryKey, bool) {
+	if auth == nil {
+		return authMethodRegistryKey{}, false
+	}
+
+	representation := *(*[2]uintptr)(unsafe.Pointer(&auth))
+	if representation[1] == 0 {
+		return authMethodRegistryKey{}, false
+	}
+
+	return authMethodRegistryKey{
+		typ:  representation[0],
+		data: representation[1],
+	}, true
+}
+
 // CreateAuthMethodPassword returns ssh.AuthMethod generated from password.
 func CreateAuthMethodPassword(password string) (auth ssh.AuthMethod) {
-	return ssh.Password(password)
+	auth = ssh.Password(password)
+	registerControlPersistAuthMethod(auth, controlPersistAuthMethodDefinition{
+		Type:     "password",
+		Password: password,
+	})
+	return
 }
 
 // CreateAuthMethodPublicKey returns ssh.AuthMethod generated from PublicKey.
@@ -36,6 +227,11 @@ func CreateAuthMethodPublicKey(key, password string) (auth ssh.AuthMethod, err e
 	}
 
 	auth = ssh.PublicKeys(signer)
+	registerControlPersistAuthMethod(auth, controlPersistAuthMethodDefinition{
+		Type:    "publickey",
+		KeyPath: key,
+		KeyPass: password,
+	})
 	return
 }
 

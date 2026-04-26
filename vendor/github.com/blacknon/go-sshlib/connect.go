@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Blacknon. All rights reserved.
+// Copyright (c) 2026 Blacknon. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
 
@@ -6,11 +6,14 @@ package sshlib
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +27,14 @@ type Connect struct {
 	// Client *ssh.Client
 	Client *ssh.Client
 
+	controlClient  *controlClient
+	controlMaster  *controlMaster
+	controlHost    string
+	controlPort    string
+	controlUser    string
+	controlSpawned bool
+	proxyConnects  []*Connect
+
 	// Session
 	Session *ssh.Session
 
@@ -34,6 +45,9 @@ type Connect struct {
 
 	// ProxyDialer
 	ProxyDialer proxy.ContextDialer
+
+	// ProxyRoute takes precedence over ProxyDialer when set.
+	ProxyRoute []ProxyRoute
 
 	// Connect timeout second.
 	ConnectTimeout int
@@ -52,6 +66,9 @@ type Connect struct {
 
 	// Set the TTY to be used as the input and output for the Session/Cmd.
 	PtyRelayTty *os.File
+
+	// StdoutMutex is a mutex for use Stdout.
+	StdoutMutex *sync.Mutex
 
 	// CheckKnownHosts if true, check knownhosts.
 	// Ignored if HostKeyCallback is set.
@@ -99,8 +116,27 @@ type Connect struct {
 	// Set it before CraeteClient.
 	ForwardX11Trusted bool
 
+	x11HandlerOnce sync.Once
+
 	// Dynamic forward related logger
 	DynamicForwardLogger *log.Logger
+
+	// ControlMaster enables OpenSSH-like connection sharing via a local control socket.
+	// Supported values are "", "no", "yes", and "auto".
+	ControlMaster string
+
+	// ControlPath is the Unix domain socket path used for connection sharing.
+	ControlPath string
+
+	// ControlPersist keeps the local control socket alive while the owning process remains alive.
+	// When greater than zero, sshlib will try to start a detached helper process.
+	ControlPersist time.Duration
+
+	// ControlPersistAuth contains auth methods that can be replayed by the detached helper.
+	// Set ControlPersistAuth.AuthMethods with auth methods created by
+	// sshlib.CreateAuthMethodPassword or sshlib.CreateAuthMethodPublicKey.
+	// Required when ControlPersist > 0 and no master is already running.
+	ControlPersistAuth *ControlPersistAuth
 
 	// shell terminal log flag
 	logging bool
@@ -117,7 +153,103 @@ type Connect struct {
 
 // CreateClient set c.Client.
 func (c *Connect) CreateClient(host, port, user string, authMethods []ssh.AuthMethod) (err error) {
+	debugf("sshlib: CreateClient host=%s port=%s user=%s control_master=%s persist=%s proxy_route=%d proxy_dialer=%t\n",
+		host, port, user, c.ControlMaster, c.ControlPersist, len(c.ProxyRoute), c.ProxyDialer != nil)
+	c.controlClient = nil
+	c.controlSpawned = false
+	c.controlHost = host
+	c.controlPort = port
+	c.controlUser = user
+
+	authMethods, err = c.resolveAuthMethods(authMethods, nil)
+	if err != nil {
+		return err
+	}
+
+	mode := c.controlMode()
+	if mode == "" || mode == "no" {
+		debugln("sshlib: CreateClient using direct mode")
+		return c.createDirectClient(host, port, user, authMethods)
+	}
+
+	if c.ControlPath == "" {
+		return errors.New("sshlib: ControlPath is required when ControlMaster is enabled")
+	}
+
+	if mode == "auto" || mode == "yes" {
+		debugf("sshlib: attempting existing control socket path=%s\n", c.ControlPath)
+		client, cerr := dialControlClient(c.ControlPath)
+		if cerr == nil {
+			debugln("sshlib: connected to existing control master")
+			c.controlClient = client
+			return nil
+		}
+		debugf("sshlib: no existing control master path=%s err=%v\n", c.ControlPath, cerr)
+
+		if mode == "yes" {
+			return cerr
+		}
+	}
+
+	if c.ControlPersist > 0 {
+		debugln("sshlib: spawning detached control master")
+		if err := c.startDetachedControlMaster(host, port, user); err != nil {
+			return err
+		}
+		c.controlSpawned = true
+
+		client, err := waitForControlClient(c.ControlPath, 5*time.Second)
+		if err != nil {
+			debugf("sshlib: waiting for control client failed path=%s err=%v\n", c.ControlPath, err)
+			return err
+		}
+		debugln("sshlib: detached control master ready")
+		c.controlClient = client
+		return nil
+	}
+
+	if err := c.createDirectClient(host, port, user, authMethods); err != nil {
+		return err
+	}
+
+	master, err := newControlMaster(c, c.ControlPath)
+	if err != nil {
+		c.Client.Close()
+		c.Client = nil
+		return err
+	}
+	c.controlMaster = master
+
+	return nil
+}
+
+func (c *Connect) resolveAuthMethods(authMethods []ssh.AuthMethod, prompt PromptFunc) ([]ssh.AuthMethod, error) {
+	if len(authMethods) > 0 {
+		return authMethods, nil
+	}
+	if c.ControlPersistAuth == nil {
+		return authMethods, nil
+	}
+
+	resolved, err := c.ControlPersistAuth.resolved()
+	if err != nil {
+		return nil, err
+	}
+
+	return createControlPersistAuthMethodsWithPrompt(resolved, prompt)
+}
+
+func (c *Connect) IsControlClient() bool {
+	return c.isControlClient()
+}
+
+func (c *Connect) SpawnedControlMaster() bool {
+	return c.controlSpawned
+}
+
+func (c *Connect) createDirectClient(host, port, user string, authMethods []ssh.AuthMethod) (err error) {
 	uri := net.JoinHostPort(host, port)
+	debugf("sshlib: createDirectClient begin uri=%s user=%s timeout=%ds\n", uri, user, c.ConnectTimeout)
 
 	timeout := 20
 	if c.ConnectTimeout == 0 {
@@ -139,56 +271,156 @@ func (c *Connect) CreateClient(host, port, user string, authMethods []ssh.AuthMe
 				// append default files
 				c.KnownHostsFiles = append(c.KnownHostsFiles, "~/.ssh/known_hosts")
 			}
-			config.HostKeyCallback = c.verifyAndAppendNew
+			config.HostKeyCallback = c.VerifyAndAppendNew
 		} else {
 			config.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 		}
 	}
 
 	// check Dialer
-	if c.ProxyDialer == nil {
-		c.ProxyDialer = proxy.Direct
+	dialer := c.ProxyDialer
+	proxyConnects := c.proxyConnects
+	if len(c.ProxyRoute) > 0 {
+		if err := c.closeProxyConnects(); err != nil {
+			return err
+		}
+		dialer, proxyConnects, err = buildProxyRouteDialer(c.ProxyRoute, nil)
+		if err != nil {
+			return err
+		}
+	} else if dialer == nil {
+		dialer = proxy.Direct
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.ConnectTimeout)*time.Second)
 	defer cancel()
 
 	// Dial to host:port
-	netConn, cerr := c.ProxyDialer.DialContext(ctx, "tcp", uri)
+	debugf("sshlib: dialing network=tcp addr=%s\n", uri)
+	netConn, cerr := dialer.DialContext(ctx, "tcp", uri)
 	if cerr != nil {
+		debugf("sshlib: dial failed addr=%s err=%v\n", uri, cerr)
+		_ = closeProxyConnectList(proxyConnects)
 		return cerr
 	}
+	debugf("sshlib: dial succeeded addr=%s\n", uri)
 
 	// Set deadline
-	netConn.SetDeadline(time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second))
+	_ = netConn.SetDeadline(time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second))
 
 	// Create new ssh connect
+	debugf("sshlib: starting ssh handshake addr=%s\n", uri)
 	sshCon, channel, req, cerr := ssh.NewClientConn(netConn, uri, config)
 	if cerr != nil {
+		debugf("sshlib: ssh handshake failed addr=%s err=%v\n", uri, cerr)
+		_ = netConn.Close()
+		_ = closeProxyConnectList(proxyConnects)
 		return cerr
 	}
+	debugf("sshlib: ssh handshake succeeded addr=%s\n", uri)
 
 	// Reet deadline
-	netConn.SetDeadline(time.Time{})
+	_ = netConn.SetDeadline(time.Time{})
 
 	// Create *ssh.Client
 	c.Client = ssh.NewClient(sshCon, channel, req)
+	c.proxyConnects = proxyConnects
+	debugf("sshlib: createDirectClient success uri=%s\n", uri)
 
 	return
 }
 
+func (c *Connect) controlMode() string {
+	switch c.ControlMaster {
+	case "", "no":
+		return c.ControlMaster
+	case "yes", "auto":
+		return c.ControlMaster
+	default:
+		return ""
+	}
+}
+
+func (c *Connect) isControlClient() bool {
+	return c.controlClient != nil
+}
+
+// Close releases control resources and the underlying SSH client.
+func (c *Connect) Close() error {
+	var err error
+
+	if c.controlClient != nil {
+		err = c.controlClient.Close()
+		c.controlClient = nil
+	}
+
+	if c.controlMaster != nil {
+		closeErr := c.controlMaster.Close()
+		c.controlMaster = nil
+		if err == nil {
+			err = closeErr
+		}
+	}
+
+	if c.Client != nil {
+		closeErr := c.Client.Close()
+		c.Client = nil
+		if err == nil {
+			err = closeErr
+		}
+	}
+
+	closeErr := c.closeProxyConnects()
+	if err == nil {
+		err = closeErr
+	}
+
+	return err
+}
+
+func (c *Connect) closeProxyConnects() error {
+	err := closeProxyConnectList(c.proxyConnects)
+	c.proxyConnects = nil
+	return err
+}
+
 // CreateSession retrun ssh.Session
 func (c *Connect) CreateSession() (session *ssh.Session, err error) {
+	if c.isControlClient() {
+		return nil, errors.New("sshlib: CreateSession is not available over ControlMaster; use Command, Shell(nil), or CmdShell(nil, command)")
+	}
+
 	// Create session
 	session, err = c.Client.NewSession()
 	return
 }
 
-// SendKeepAlive send packet to session.
-// TODO(blacknon): Interval及びMaxを設定できるようにする(v0.1.1)
-func (c *Connect) SendKeepAlive(session *ssh.Session) {
-	// keep alive interval (default 30 sec)
-	interval := 1
+// Dial opens a connection using the active SSH transport.
+// When ControlMaster is enabled, the dial is tunneled via the control socket.
+func (c *Connect) Dial(network, addr string) (net.Conn, error) {
+	if c.isControlClient() {
+		return c.controlClient.Dial(network, addr)
+	}
+	if c.Client == nil {
+		return nil, errors.New("ssh client is nil")
+	}
+	return c.Client.Dial(network, addr)
+}
+
+// Listen starts a remote listener using the active SSH transport.
+// When ControlMaster is enabled, the listener is managed by the control master.
+func (c *Connect) Listen(network, addr string) (net.Listener, error) {
+	if c.isControlClient() {
+		return c.controlClient.Listen(network, addr)
+	}
+	if c.Client == nil {
+		return nil, errors.New("ssh client is nil")
+	}
+	return c.Client.Listen(network, addr)
+}
+
+func (c *Connect) keepAliveConfig() (time.Duration, int) {
+	interval := 30
 	if c.SendKeepAliveInterval > 0 {
 		interval = c.SendKeepAliveInterval
 	}
@@ -198,32 +430,77 @@ func (c *Connect) SendKeepAlive(session *ssh.Session) {
 		max = c.SendKeepAliveMax
 	}
 
-	t := time.NewTicker(time.Duration(c.ConnectTimeout) * time.Second)
-	defer t.Stop()
+	return time.Duration(interval) * time.Second, max
+}
 
-	count := 0
-	for {
-		select {
-		case <-t.C:
-			if _, err := session.SendRequest("keepalive@openssh.com", true, nil); err != nil {
-				log.Println("Failed to send keepalive packet:", err)
-				count += 1
-			} else {
-				// err is nil.
-				time.Sleep(time.Duration(interval) * time.Second)
+func (c *Connect) startSessionKeepAlive(session *ssh.Session) func() {
+	done := make(chan struct{})
+
+	go func() {
+		interval, max := c.keepAliveConfig()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+
+		failures := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if _, err := session.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+					log.Println("Failed to send keepalive packet:", err)
+					failures++
+					if failures > max {
+						_ = session.Close()
+						return
+					}
+					continue
+				}
+
+				failures = 0
 			}
 		}
+	}()
 
-		if count > max {
-			return
+	return func() {
+		close(done)
+	}
+}
+
+// SendKeepAlive send packet to session.
+// TODO(blacknon): Interval及びMaxを設定できるようにする(v0.1.1)
+func (c *Connect) SendKeepAlive(session *ssh.Session) {
+	interval, max := c.keepAliveConfig()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	failures := 0
+	for range t.C {
+		if _, err := session.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			log.Println("Failed to send keepalive packet:", err)
+			failures++
+			if failures > max {
+				_ = session.Close()
+				return
+			}
+			continue
 		}
+
+		failures = 0
 	}
 }
 
 // CheckClientAlive check alive ssh.Client.
 func (c *Connect) CheckClientAlive() error {
-	_, _, err := c.Client.SendRequest("keepalive", true, nil)
+	if c.isControlClient() {
+		return c.controlClient.Ping()
+	}
+
+	_, _, err := c.Client.SendRequest("keepalive@openssh.com", true, nil)
 	if err == nil {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "request failed") {
 		return nil
 	}
 	return err
@@ -232,28 +509,17 @@ func (c *Connect) CheckClientAlive() error {
 // RequestTty requests the association of a pty with the session on the remote
 // host. Terminal size is obtained from the currently connected terminal
 func RequestTty(session *ssh.Session) (err error) {
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-
 	// Get terminal window size
 	fd := int(os.Stdout.Fd())
-	width, hight, err := terminal.GetSize(fd)
+	width, height, err := terminal.GetSize(fd)
 	if err != nil {
 		return
 	}
 
 	// Get env `TERM`
 	term := os.Getenv("TERM")
-	if len(term) == 0 {
-		term = "xterm"
-	}
-
-	if err = session.RequestPty(term, hight, width, modes); err != nil {
-		session.Close()
-		return
+	if err = RequestTtyWithSize(session, term, width, height, nil); err != nil {
+		return err
 	}
 
 	// Terminal resize goroutine.
@@ -266,11 +532,54 @@ func RequestTty(session *ssh.Session) (err error) {
 			switch s {
 			case winch:
 				fd := int(os.Stdout.Fd())
-				width, hight, _ = terminal.GetSize(fd)
-				session.WindowChange(hight, width)
+				width, height, _ = terminal.GetSize(fd)
+				session.WindowChange(height, width)
 			}
 		}
 	}()
 
 	return
+}
+
+func defaultTerminalModes() ssh.TerminalModes {
+	return ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+}
+
+func normalizeTerminalTerm(term string) string {
+	if term == "" {
+		term = os.Getenv("TERM")
+	}
+	if term == "" {
+		return "xterm-256color"
+	}
+	return term
+}
+
+func normalizeTerminalModes(modes ssh.TerminalModes) ssh.TerminalModes {
+	if len(modes) == 0 {
+		return defaultTerminalModes()
+	}
+	return modes
+}
+
+// RequestTtyWithSize requests the association of a pty with the session on the
+// remote host using the caller-provided terminal size.
+func RequestTtyWithSize(session *ssh.Session, term string, cols, rows int, modes ssh.TerminalModes) error {
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+
+	if err := session.RequestPty(normalizeTerminalTerm(term), rows, cols, normalizeTerminalModes(modes)); err != nil {
+		session.Close()
+		return err
+	}
+
+	return nil
 }

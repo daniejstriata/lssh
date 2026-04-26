@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Blacknon. All rights reserved.
+# Use of this source code is governed by an MIT license
+# that can be found in the LICENSE file.
+
+name: Demo Test Job.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  demo-e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run demo e2e test
+        env:
+          LSSH_RUN_DEMO_E2E: "1"
+        run: sudo modprobe fuse && go test -v ./demo -run TestDemoDockerComposeE2E
